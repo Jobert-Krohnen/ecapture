@@ -18,6 +18,7 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -25,6 +26,22 @@ import (
 	"golang.org/x/net/http2"
 	"golang.org/x/net/http2/hpack"
 )
+
+const frameHeaderLen = 9
+
+// http2.FrameType
+// const (
+//     FrameData         FrameType = 0x0
+//     FrameHeaders      FrameType = 0x1
+//     FramePriority     FrameType = 0x2
+//     FrameRSTStream    FrameType = 0x3
+//     FrameSettings     FrameType = 0x4
+//     FramePushPromise  FrameType = 0x5
+//     FramePing         FrameType = 0x6
+//     FrameGoAway       FrameType = 0x7
+//     FrameWindowUpdate FrameType = 0x8
+//     FrameContinuation FrameType = 0x9
+// )
 
 type HTTP2Response struct {
 	framer     *http2.Framer
@@ -36,15 +53,37 @@ type HTTP2Response struct {
 }
 
 func (h2r *HTTP2Response) detect(payload []byte) error {
-	rd := bytes.NewReader(payload)
-	buf := bufio.NewReader(rd)
-	framer := http2.NewFramer(nil, buf)
-	framer.ReadMetaHeaders = hpack.NewDecoder(0, nil)
-	_, err := framer.ReadFrame()
-	if err != nil {
-		return err
+	payloadLen := len(payload)
+	if payloadLen < frameHeaderLen {
+		return errors.New("Payload less than http2 frame Header")
 	}
-	return nil
+	// https://httpwg.org/specs/rfc7540.html#FrameHeader
+	// All frames begin with a fixed 9-octet header followed by a variable-length payload.
+	//
+	// +-----------------------------------------------+
+	// |                 Length (24)                   |
+	// +---------------+---------------+---------------+
+	// |   Type (8)    |   Flags (8)   |
+	// +-+-------------+---------------+-------------------------------+
+	// |R|                 Stream Identifier (31)                      |
+	// +=+=============================================================+
+	// |                   Frame Payload (0...)                      ...
+	// +---------------------------------------------------------------+
+	data := payload[0:frameHeaderLen]
+	// currentFrameLen := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
+	currentFrameType := http2.FrameType(data[3])
+	// Frame type in http2.FrameType
+	if currentFrameType > http2.FrameContinuation {
+		return errors.New("Invalid frame type")
+	}
+	// R: A reserved 1-bit field.
+	// The semantics of this bit are undefined, and the bit MUST remain unset (0x0) when
+	// sending and MUST be ignored when receiving.
+	reservedBit := uint32(data[5]) >> 7
+	if reservedBit == 0 {
+		return nil
+	}
+	return errors.New("Invalid reserved bit in frame header")
 }
 
 func (h2r *HTTP2Response) Init() {
@@ -84,6 +123,7 @@ func (h2r *HTTP2Response) IsDone() bool {
 
 func (h2r *HTTP2Response) Display() []byte {
 	var encoding string
+	var dataFrameStreamID uint32
 	dataBuf := bytes.NewBuffer(nil)
 	frameBuf := bytes.NewBufferString("")
 	for {
@@ -96,7 +136,7 @@ func (h2r *HTTP2Response) Display() []byte {
 		}
 		switch f := f.(type) {
 		case *http2.MetaHeadersFrame:
-			frameBuf.WriteString(fmt.Sprintf("\nFrame Type\t=>\tHEADERS\n"))
+			frameBuf.WriteString(fmt.Sprintf("\nFrame Type\t=>\tHEADERS\nFrame StreamID\t=>\t%d\n", f.StreamID))
 			for _, header := range f.Fields {
 				frameBuf.WriteString(fmt.Sprintf("%s\n", header.String()))
 				if header.Name == "content-encoding" {
@@ -104,18 +144,19 @@ func (h2r *HTTP2Response) Display() []byte {
 				}
 			}
 		case *http2.DataFrame:
+			dataFrameStreamID = f.StreamID
 			_, err := dataBuf.Write(f.Data())
 			if err != nil {
 				log.Println("[http2 response] Write HTTP2 Data Frame buffuer error:", err)
 			}
 		default:
 			fh := f.Header()
-			frameBuf.WriteString(fmt.Sprintf("\nFrame Type\t=>\t%s\n", fh.Type.String()))
+			frameBuf.WriteString(fmt.Sprintf("\nFrame Type\t=>\t%s\nFrame StreamID\t=>\t%d\n", fh.Type.String(), fh.StreamID))
 		}
 	}
 	// merge data frame
 	if dataBuf.Len() > 0 {
-		frameBuf.WriteString(fmt.Sprintf("\nFrame Type\t=>\tDATA\n"))
+		frameBuf.WriteString(fmt.Sprintf("\nFrame Type\t=>\tDATA\nFrame StreamID\t=>\t%d\n", dataFrameStreamID))
 		payload := dataBuf.Bytes()
 		switch encoding {
 		case "gzip":

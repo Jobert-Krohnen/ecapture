@@ -4,6 +4,7 @@
 #include <ssl/ssl_local.h>
 #include <stddef.h>
 #include <stdio.h>
+#include <ctype.h>
 
 #define SSL_STRUCT_OFFSETS                          \
     X(ssl_st, type)                                 \
@@ -24,6 +25,8 @@
     X(ssl_connection_st, server_app_traffic_secret) \
     X(ssl_connection_st, exporter_master_secret)    \
     X(bio_st, num)                                  \
+    X(bio_st, method)                               \
+    X(bio_method_st, type)                          \
     X(quic_conn_st, tls)
 
 void toUpper(char *s) {

@@ -2,15 +2,16 @@ package module
 
 import (
 	"errors"
+	"math"
+	"os"
+	"path"
+	"strings"
+
 	"github.com/cilium/ebpf"
 	manager "github.com/gojue/ebpfmanager"
 	"github.com/gojue/ecapture/user/config"
 	"github.com/gojue/ecapture/user/event"
 	"golang.org/x/sys/unix"
-	"math"
-	"os"
-	"path"
-	"strings"
 )
 
 func (m *MOpenSSLProbe) setupManagersText() error {
@@ -77,10 +78,40 @@ func (m *MOpenSSLProbe) setupManagersText() error {
 				UID:              "kprobe_sys_connect",
 			},
 			{
+				Section:          "kprobe/inet_stream_connect",
+				EbpfFuncName:     "probe_inet_stream_connect",
+				AttachToFuncName: "inet_stream_connect",
+				UID:              "kprobe_sys_inet_stream_connect",
+			},
+			{
+				Section:          "kretprobe/sys_connect",
+				EbpfFuncName:     "retprobe_connect",
+				AttachToFuncName: "__sys_connect",
+				UID:              "kretprobe_sys_connect",
+			},
+			{
 				Section:          "kprobe/sys_connect",
 				EbpfFuncName:     "probe_connect",
 				AttachToFuncName: "__sys_accept4",
 				UID:              "kprobe_sys_accept4",
+			},
+			{
+				Section:          "kprobe/inet_accept",
+				EbpfFuncName:     "probe_inet_accept",
+				AttachToFuncName: "inet_accept",
+				UID:              "kprobe_inet_accept",
+			},
+			{
+				Section:          "kretprobe/__sys_accept4",
+				EbpfFuncName:     "retprobe_accept4",
+				AttachToFuncName: "__sys_accept4",
+				UID:              "kretprobe_sys_accept4",
+			},
+			{
+				Section:          "kprobe/tcp_v4_destroy_sock",
+				EbpfFuncName:     "probe_tcp_v4_destroy_sock",
+				AttachToFuncName: "tcp_v4_destroy_sock",
+				UID:              "kprobe_tcp_v4_destroy_sock",
 			},
 
 			// --------------------------------------------------
