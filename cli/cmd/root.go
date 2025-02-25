@@ -17,11 +17,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"github.com/gojue/ecapture/cli/cobrautl"
-	"github.com/gojue/ecapture/cli/http"
-	"github.com/gojue/ecapture/user/config"
-	"github.com/gojue/ecapture/user/module"
-	"github.com/rs/zerolog"
 	"io"
 	"net"
 	"os"
@@ -30,6 +25,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gojue/ecapture/cli/cobrautl"
+	"github.com/gojue/ecapture/cli/http"
+	"github.com/gojue/ecapture/user/config"
+	"github.com/gojue/ecapture/user/module"
+	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
 )
 
@@ -39,12 +39,14 @@ const (
 	CliDescription = "Capturing SSL/TLS plaintext without a CA certificate using eBPF. Supported on Linux/Android kernels for amd64/arm64."
 	CliHomepage    = "https://ecapture.cc"
 	CliAuthor      = "CFC4N <cfc4ncs@gmail.com>"
-	CliRepo        = "https://github.com/gojue/ecapture"
+	CliGithubRepo  = "https://github.com/gojue/ecapture"
 )
 
 var (
-	GitVersion = "v0.0.0_unknow"
+	// GitVersion default value, eg: linux_arm64:v0.8.10-20241116-fcddaeb:5.15.0-125-generic
+	GitVersion = "os_arch:v0.0.0-20221111-develop:default_kernel"
 	//ReleaseDate = "2022-03-16"
+	ByteCodeFiles = "all" // Indicates the type of bytecode files built by the project, i.e., the file types under the assets/* folder. Default is "all", meaning both types are included.
 )
 
 const (
@@ -69,9 +71,9 @@ var rootCmd = &cobra.Command{
 	Short:      CliDescription,
 	SuggestFor: []string{"ecapture"},
 
-	Long: `eCapture(旁观者) is a tool that can capture plaintext packets 
+	Long: `eCapture(旁观者) is a tool that can capture plaintext packets
 such as HTTPS and TLS without installing a CA certificate.
-It can also capture bash commands, which is suitable for 
+It can also capture bash commands, which is suitable for
 security auditing scenarios, such as database auditing of mysqld, etc (disabled on Android).
 Support Linux(Android)  X86_64 4.18/aarch64 5.5 or newer.
 Repository: https://github.com/gojue/ecapture
@@ -88,6 +90,14 @@ docker run --rm --privileged=true --net=host -v ${HOST_PATH}:${CONTAINER_PATH} g
 	// Uncomment the following line if your bare application
 	// has an action associated with it:
 	// Run: func(cmd *cobra.Command, args []string) { },
+
+	PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+		if err := detectEnv(); err != nil {
+			return err
+		}
+
+		return nil
+	},
 }
 
 func usageFunc(c *cobra.Command) error {
@@ -124,6 +134,8 @@ func init() {
 	rootCmd.PersistentFlags().StringVarP(&globalConf.LoggerAddr, "logaddr", "l", "", "send logs to this server. -l /tmp/ecapture.log or -l tcp://127.0.0.1:8080")
 	rootCmd.PersistentFlags().StringVar(&globalConf.EventCollectorAddr, "eventaddr", "", "the server address that receives the captured event. --eventaddr tcp://127.0.0.1:8090, default: same as logaddr")
 	rootCmd.PersistentFlags().StringVar(&globalConf.Listen, "listen", eCaptureListenAddr, "listen on this address for http server, default: 127.0.0.1:28256")
+
+	rootCmd.SilenceUsage = true
 }
 
 // eventCollector
@@ -144,6 +156,15 @@ func setModConfig(globalConf config.BaseConfig, modConf config.IConfig) {
 	modConf.SetBTF(globalConf.BtfMode)
 	modConf.SetPerCpuMapSize(globalConf.PerCpuMapSize)
 	modConf.SetAddrType(loggerTypeStdout)
+
+	switch ByteCodeFiles {
+	case "core":
+		modConf.SetByteCodeFileMode(config.ByteCodeFileCore)
+	case "noncore":
+		modConf.SetByteCodeFileMode(config.ByteCodeFileNonCore)
+	default:
+		modConf.SetByteCodeFileMode(config.ByteCodeFileAll)
+	}
 }
 
 // initLogger init logger
@@ -198,7 +219,7 @@ func runModule(modName string, modConfig config.IConfig) {
 	// init eCapture
 	logger.Info().Str("AppName", fmt.Sprintf("%s(%s)", CliName, CliNameZh)).Send()
 	logger.Info().Str("HomePage", CliHomepage).Send()
-	logger.Info().Str("Repository", CliRepo).Send()
+	logger.Info().Str("Repository", CliGithubRepo).Send()
 	logger.Info().Str("Author", CliAuthor).Send()
 	logger.Info().Str("Description", CliDescription).Send()
 	logger.Info().Str("Version", GitVersion).Send()
@@ -213,13 +234,25 @@ func runModule(modName string, modConfig config.IConfig) {
 	// listen http server
 	go func() {
 		logger.Info().Str("listen", globalConf.Listen).Send()
-		logger.Info().Msg("https server starting...You can update the configuration file via the HTTP interface.")
+		logger.Info().Msg("https server starting...You can upgrade the configuration file via the HTTP interface.")
 		var ec = http.NewHttpServer(globalConf.Listen, reRloadConfig, logger)
 		err = ec.Run()
 		if err != nil {
 			logger.Fatal().Err(err).Msg("http server start failed")
 			return
 		}
+	}()
+
+	ctx, cancelFun := context.WithCancel(context.TODO())
+
+	// upgrade check
+	go func() {
+		tags, url, e := upgradeCheck(ctx)
+		if e != nil {
+			logger.Debug().Msgf("upgrade check failed: %v", e)
+			return
+		}
+		logger.Warn().Msgf("A new version %s is available:%s", tags, url)
 	}()
 
 	// run module
@@ -236,9 +269,7 @@ func runModule(modName string, modConfig config.IConfig) {
 
 	reload:
 		// 初始化
-		logger.Warn().Msg("========== module starting. ==========")
 		mod := modFunc()
-		ctx, cancelFun := context.WithCancel(context.TODO())
 		err = mod.Init(ctx, &logger, modConfig, ecw)
 		if err != nil {
 			logger.Fatal().Err(err).Bool("isReload", isReload).Msg("module initialization failed")
@@ -247,7 +278,7 @@ func runModule(modName string, modConfig config.IConfig) {
 
 		err = mod.Run()
 		if err != nil {
-			logger.Fatal().Err(err).Bool("isReload", isReload).Msg("module run failed, skip it.")
+			logger.Fatal().Err(err).Bool("isReload", isReload).Msg("module run failed.")
 		}
 		logger.Info().Str("moduleName", modName).Bool("isReload", isReload).Msg("module started successfully.")
 

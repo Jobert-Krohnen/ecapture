@@ -34,6 +34,7 @@ CMD_DPKG-DEB ?= dpkg-deb
 CMD_ECHO ?= echo
 
 KERNEL_LESS_5_2_PREFIX ?= _less52.o
+BYTECODE_FILES ?= all
 STYLE    ?= "{BasedOnStyle: Google, IndentWidth: 4, TabWidth: 4, UseTab: Never, ColumnLimit: 120}"
 IGNORE_LESS52 ?=
 AUTOGENCMD ?=
@@ -83,7 +84,7 @@ TAG_COMMIT := $(shell git rev-list --abbrev-commit --tags --max-count=1)
 TAG := $(shell git describe --abbrev=0 --tags ${TAG_COMMIT} 2>/dev/null || true)
 COMMIT := $(shell git rev-parse --short HEAD)
 DATE := $(shell git log -1 --format=%cd --date=format:"%Y%m%d")
-LAST_GIT_TAG := $(TAG:v%=%)-$(DATE)-$(COMMIT)
+LAST_GIT_TAG := $(TAG)-$(DATE)-$(COMMIT)
 RPM_RELEASE := $(DATE).$(COMMIT)
 
 #VERSION_NUM ?= $(if $(SNAPSHOT_VERSION),$(SNAPSHOT_VERSION),$(LAST_GIT_TAG))
@@ -181,7 +182,7 @@ KERN_RELEASE ?= $(UNAME_R)
 KERN_BUILD_PATH ?= $(if $(KERN_HEADERS),$(KERN_HEADERS),/lib/modules/$(KERN_RELEASE)/build)
 KERN_SRC_PATH ?= $(if $(KERN_HEADERS),$(KERN_HEADERS),$(if $(wildcard /lib/modules/$(KERN_RELEASE)/source),/lib/modules/$(KERN_RELEASE)/source,$(KERN_BUILD_PATH)))
 
-BPF_NOCORE_TAG = $(subst .,_,$(KERN_RELEASE)).$(subst .,_,$(VERSION_NUM))
+BPF_NOCORE_TAG = $(subst .,_,$(KERN_RELEASE)):$(subst .,_,$(VERSION_NUM))
 
 #
 # BPF Source file
@@ -189,6 +190,7 @@ BPF_NOCORE_TAG = $(subst .,_,$(KERN_RELEASE)).$(subst .,_,$(VERSION_NUM))
 TARGETS := kern/boringssl_na
 TARGETS += kern/boringssl_a_13
 TARGETS += kern/boringssl_a_14
+TARGETS += kern/boringssl_a_15
 TARGETS += kern/openssl_1_1_1a
 TARGETS += kern/openssl_1_1_1b
 TARGETS += kern/openssl_1_1_1d
@@ -196,12 +198,24 @@ TARGETS += kern/openssl_1_1_1j
 TARGETS += kern/openssl_1_1_0a
 TARGETS += kern/openssl_1_0_2a
 TARGETS += kern/openssl_3_0_0
+TARGETS += kern/openssl_3_1_0
 TARGETS += kern/openssl_3_2_0
+TARGETS += kern/openssl_3_2_3
+TARGETS += kern/openssl_3_3_0
+TARGETS += kern/openssl_3_3_2
+TARGETS += kern/openssl_3_4_0
 TARGETS += kern/gotls
 
 ifeq ($(ANDROID),0)
 	TARGETS += kern/bash
-	TARGETS += kern/gnutls
+	TARGETS += kern/zsh
+	TARGETS += kern/gnutls_3_6_12
+	TARGETS += kern/gnutls_3_6_14
+	TARGETS += kern/gnutls_3_7_0
+	TARGETS += kern/gnutls_3_7_3
+	TARGETS += kern/gnutls_3_7_7
+	TARGETS += kern/gnutls_3_8_4
+	TARGETS += kern/gnutls_3_8_7
 	TARGETS += kern/nspr
 	TARGETS += kern/mysqld
 	TARGETS += kern/postgres
