@@ -1,8 +1,8 @@
-#ifndef ECAPTURE_OPENSSL_3_2_2_KERN_H
-#define ECAPTURE_OPENSSL_3_2_2_KERN_H
+#ifndef ECAPTURE_OPENSSL_3_3_0_KERN_H
+#define ECAPTURE_OPENSSL_3_3_0_KERN_H
 
-/* OPENSSL_VERSION_TEXT: OpenSSL 3.2.2 4 Jun 2024 */
-/* OPENSSL_VERSION_NUMBER: 807403552 */
+/* OPENSSL_VERSION_TEXT: OpenSSL 3.3.1 4 Jun 2024 */
+/* OPENSSL_VERSION_NUMBER: 808452112 */
 
 // ssl_st->type
 #define SSL_ST_TYPE 0x0
@@ -58,6 +58,12 @@
 // bio_st->num
 #define BIO_ST_NUM 0x38
 
+// bio_st->method
+#define BIO_ST_METHOD 0x8
+
+// bio_method_st->type
+#define BIO_METHOD_ST_TYPE 0x0
+
 // quic_conn_st->tls
 #define QUIC_CONN_ST_TLS 0x40
 
@@ -66,6 +72,7 @@
 #define SSL_ST_WBIO SSL_CONNECTION_ST_WBIO
 
 #define SSL_ST_RBIO SSL_CONNECTION_ST_RBIO
+
 
 #include "openssl.h"
 #include "openssl_masterkey_3.2.h"

@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+
 	"github.com/gojue/ecapture/user/event"
 )
 
@@ -33,9 +34,7 @@ const (
 const ChunkSize = 16
 const ChunkSizeHalf = ChunkSize / 2
 
-const MaxDataSize = 1024 * 4
-
-//const SaDataLen = 14
+const MaxDataSize = 1024 * 16
 
 const (
 	Ssl2Version   = 0x0002

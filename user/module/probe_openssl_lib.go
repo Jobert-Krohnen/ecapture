@@ -16,22 +16,25 @@ package module
 
 import (
 	"debug/elf"
+	"errors"
 	"fmt"
-	"github.com/gojue/ecapture/user/config"
 	"os"
 	"regexp"
 	"strings"
+
+	"github.com/gojue/ecapture/user/config"
 )
 
 const (
-	Linuxdefaulefilename102 = "linux_default_1_0_2"
-	Linuxdefaulefilename110 = "linux_default_1_1_0"
-	Linuxdefaulefilename111 = "linux_default_1_1_1"
-	Linuxdefaulefilename30  = "linux_default_3_0"
-	Linuxdefaulefilename31  = "linux_default_3_0"
-	Linuxdefaulefilename320 = "linux_default_3_2"
-	Linuxdefaulefilename330 = "linux_default_3_3"
-	AndroidDefauleFilename  = "android_default"
+	LinuxDefaultFilename102 = "linux_default_1_0_2"
+	LinuxDefaultFilename110 = "linux_default_1_1_0"
+	LinuxDefaultFilename111 = "linux_default_1_1_1"
+	LinuxDefaultFilename30  = "linux_default_3_0"
+	LinuxDefaultFilename31  = "linux_default_3_0"
+	LinuxDefaultFilename320 = "linux_default_3_2"
+	LinuxDefaultFilename330 = "linux_default_3_3"
+	LinuxdDfaultFilename340 = "linux_default_3_4"
+	AndroidDefaultFilename  = "android_default"
 
 	OpenSslVersionLen = 30 // openssl version string length
 )
@@ -44,33 +47,44 @@ const (
 	MaxSupportedOpenSSL31Version  = 7
 	SupportedOpenSSL32Version2    = 2 // openssl 3.2.0 ~ 3.2.2
 	MaxSupportedOpenSSL32Version  = 3 // openssl 3.2.3 ~ newer
-	MaxSupportedOpenSSL33Version  = 2
+	SupportedOpenSSL33Version1    = 1 // openssl 3.3.0 ~ 3.3.1
+	MaxSupportedOpenSSL33Version  = 2 // openssl 3.3.2
+	SupportedOpenSSL34Version0    = 0 // openssl 3.4.0
+)
+
+var (
+	ErrProbeOpensslVerNotFound         = errors.New("OpenSSL/BoringSSL version not found")
+	ErrProbeOpensslVerBytecodeNotFound = errors.New("OpenSSL/BoringSSL version bytecode not found")
+	OpensslNoticeVersionGuideAndroid   = "\"--ssl_version='boringssl_a_13'\" , \"--ssl_version='boringssl_a_14'\""
+	OpensslNoticeVersionGuideLinux     = "\"--ssl_version='openssl x.x.x'\", support openssl 1.0.x, 1.1.x, 3.x or newer"
+	OpensslNoticeUsedDefault           = "If you want to use the specific version, please set the sslVersion parameter with %s, or use \"ecapture tls --help\" for more help."
 )
 
 // initOpensslOffset initial BpfMap
 func (m *MOpenSSLProbe) initOpensslOffset() {
 	m.sslVersionBpfMap = map[string]string{
 		// openssl 1.0.2*
-		Linuxdefaulefilename102: "openssl_1_0_2a_kern.o",
+		LinuxDefaultFilename102: "openssl_1_0_2a_kern.o",
 
 		// openssl 1.1.0*
-		Linuxdefaulefilename110: "openssl_1_1_0a_kern.o",
+		LinuxDefaultFilename110: "openssl_1_1_0a_kern.o",
 
 		// openssl 1.1.1*
-		Linuxdefaulefilename111: "openssl_1_1_1j_kern.o",
+		LinuxDefaultFilename111: "openssl_1_1_1j_kern.o",
 
 		// openssl 3.0.* and openssl 3.1.*
-		Linuxdefaulefilename30: "openssl_3_0_0_kern.o",
+		LinuxDefaultFilename30: "openssl_3_0_0_kern.o",
 
 		// openssl 3.2.*
-		Linuxdefaulefilename320: "openssl_3_2_0_kern.o",
+		LinuxDefaultFilename320: "openssl_3_2_0_kern.o",
 
 		// boringssl
 		// git repo: https://android.googlesource.com/platform/external/boringssl/+/refs/heads/android12-release
 		"boringssl 1.1.1":      "boringssl_a_13_kern.o",
 		"boringssl_a_13":       "boringssl_a_13_kern.o",
 		"boringssl_a_14":       "boringssl_a_14_kern.o",
-		AndroidDefauleFilename: "boringssl_a_13_kern.o",
+		"boringssl_a_15":       "boringssl_a_15_kern.o",
+		AndroidDefaultFilename: "boringssl_a_13_kern.o",
 
 		// non-Android boringssl
 		// "boringssl na" is a special version for non-android
@@ -117,10 +131,19 @@ func (m *MOpenSSLProbe) initOpensslOffset() {
 		m.sslVersionBpfMap[fmt.Sprintf("openssl 3.2.%d", ch)] = "openssl_3_2_3_kern.o"
 	}
 
-	// openssl 3.3.0 - newer
-	for ch := 0; ch <= MaxSupportedOpenSSL33Version; ch++ {
-		// The OpenSSL 3.3.* series is the same as the 3.2.* series of offsets
+	// openssl 3.3.0 - 3.3.1
+	for ch := 0; ch <= SupportedOpenSSL33Version1; ch++ {
 		m.sslVersionBpfMap[fmt.Sprintf("openssl 3.3.%d", ch)] = "openssl_3_3_0_kern.o"
+	}
+
+	// openssl 3.3.2
+	for ch := 2; ch <= MaxSupportedOpenSSL33Version; ch++ {
+		m.sslVersionBpfMap[fmt.Sprintf("openssl 3.3.%d", ch)] = "openssl_3_3_2_kern.o"
+	}
+
+	// openssl 3.4.0
+	for ch := 0; ch <= SupportedOpenSSL34Version0; ch++ {
+		m.sslVersionBpfMap[fmt.Sprintf("openssl 3.4.%d", ch)] = "openssl_3_4_0_kern.o"
 	}
 
 	// openssl 1.1.0a - 1.1.0l
@@ -135,27 +158,27 @@ func (m *MOpenSSLProbe) initOpensslOffset() {
 
 }
 
-func (m *MOpenSSLProbe) detectOpenssl(soPath string) error {
+func (m *MOpenSSLProbe) detectOpenssl(soPath string) (error, string) {
 	f, err := os.OpenFile(soPath, os.O_RDONLY, os.ModePerm)
 	if err != nil {
-		return fmt.Errorf("can not open %s, with error:%v", soPath, err)
+		return fmt.Errorf("can not open %s, with error:%v", soPath, err), ""
 	}
 	r, e := elf.NewFile(f)
 	if e != nil {
-		return fmt.Errorf("parse the ELF file  %s failed, with error:%v", soPath, err)
+		return fmt.Errorf("parse the ELF file  %s failed, with error:%v", soPath, err), ""
 	}
 
 	switch r.FileHeader.Machine {
 	case elf.EM_X86_64:
 	case elf.EM_AARCH64:
 	default:
-		return fmt.Errorf("unsupported arch library ,ELF Header Machine is :%s, must be one of EM_X86_64 and EM_AARCH64", r.FileHeader.Machine.String())
+		return fmt.Errorf("unsupported arch library ,ELF Header Machine is :%s, must be one of EM_X86_64 and EM_AARCH64", r.FileHeader.Machine.String()), ""
 	}
 
 	s := r.Section(".rodata")
 	if s == nil {
 		// not found
-		return fmt.Errorf("detect openssl version failed, cant read .rodata section from %s", soPath)
+		return fmt.Errorf("detect openssl version failed, cant read .rodata section from %s", soPath), ""
 	}
 
 	sectionOffset := int64(s.Offset)
@@ -165,12 +188,12 @@ func (m *MOpenSSLProbe) detectOpenssl(soPath string) error {
 
 	_, err = f.Seek(0, 0)
 	if err != nil {
-		return err
+		return err, ""
 	}
 
 	ret, err := f.Seek(sectionOffset, 0)
 	if ret != sectionOffset || err != nil {
-		return err
+		return err, ""
 	}
 
 	versionKey := ""
@@ -179,7 +202,7 @@ func (m *MOpenSSLProbe) detectOpenssl(soPath string) error {
 	// OpenSSL 3.2.0 23 Nov 2023
 	rex, err := regexp.Compile(`(OpenSSL\s\d\.\d\.[0-9a-z]+)`)
 	if err != nil {
-		return nil
+		return err, ""
 	}
 
 	buf := make([]byte, 1024*1024) // 1Mb
@@ -221,46 +244,70 @@ func (m *MOpenSSLProbe) detectOpenssl(soPath string) error {
 	_ = f.Close()
 	//buf = buf[:0]
 
-	var bpfFile string
-	var found bool
-	if versionKey != "" {
-		versionKeyLower := strings.ToLower(versionKey)
-		m.conf.(*config.OpensslConfig).SslVersion = versionKeyLower
-		m.logger.Info().Str("origin versionKey", versionKey).Str("versionKeyLower", versionKeyLower).Msg("OpenSSL/BoringSSL version found")
-		// find the sslVersion bpfFile from sslVersionBpfMap
-		bpfFile, found = m.sslVersionBpfMap[versionKeyLower]
-		if found {
-			m.sslBpfFile = bpfFile
-			return nil
-		}
+	if versionKey == "" {
+		return ErrProbeOpensslVerNotFound, ""
 	}
 
-	isAndroid := m.conf.(*config.OpensslConfig).IsAndroid
-	androidVer := m.conf.(*config.OpensslConfig).AndroidVer
+	versionKeyLower := strings.ToLower(versionKey)
+
+	return nil, versionKeyLower
+}
+
+func (m *MOpenSSLProbe) getSoDefaultBytecode(soPath string, isAndroid bool) string {
+	var bpfFile string
+	var found bool
 	// if not found, use default
 	if isAndroid {
-		// sometimes,boringssl version always was "boringssl 1.1.1" on android. but offsets are different.
-		// see kern/boringssl_a_13_kern.c and kern/boringssl_a_14_kern.c
-		// Perhaps we can utilize the Android Version to choose a specific version of boringssl.
-		// use the corresponding bpfFile
-		bpfFildAndroid := fmt.Sprintf("boringssl_a_%s", androidVer)
-		bpfFile, found = m.sslVersionBpfMap[bpfFildAndroid]
-		if found {
-			m.sslBpfFile = bpfFile
-			m.logger.Info().Str("BoringSSL Version", androidVer).Msg("OpenSSL/BoringSSL version found")
-		} else {
-			bpfFile, _ = m.sslVersionBpfMap[AndroidDefauleFilename]
-			m.logger.Warn().Str("BoringSSL Version", AndroidDefauleFilename).Msg("OpenSSL/BoringSSL version not found, used default version")
+		m.conf.(*config.OpensslConfig).SslVersion = AndroidDefaultFilename
+		androidVer := m.conf.(*config.OpensslConfig).AndroidVer
+		if androidVer != "" {
+			bpfFileKey := fmt.Sprintf("boringssl_a_%s", androidVer)
+			bpfFile, found = m.sslVersionBpfMap[bpfFileKey]
+			if found {
+				return bpfFile
+			}
 		}
-	} else {
-		if strings.Contains(soPath, "libssl.so.3") {
-			bpfFile, _ = m.sslVersionBpfMap[Linuxdefaulefilename30]
-			m.logger.Warn().Str("OpenSSL Version", Linuxdefaulefilename30).Msg("OpenSSL/BoringSSL version not found from shared library file, used default version")
-		} else {
-			bpfFile, _ = m.sslVersionBpfMap[Linuxdefaulefilename111]
-			m.logger.Warn().Str("OpenSSL Version", Linuxdefaulefilename111).Msg("OpenSSL/BoringSSL version not found from shared library file, used default version")
+		bpfFile, found = m.sslVersionBpfMap[AndroidDefaultFilename]
+		if !found {
+			m.logger.Warn().Str("BoringSSL Version", AndroidDefaultFilename).Msg("Can not find Default BoringSSL version")
+			return ""
 		}
+		//m.logger.Warn().Str("BoringSSL Version", AndroidDefauleFilename).Msg("OpenSSL/BoringSSL version not found, used default version")
+		return bpfFile
 	}
-	m.sslBpfFile = bpfFile
-	return nil
+
+	if strings.Contains(soPath, "libssl.so.3") {
+		m.conf.(*config.OpensslConfig).SslVersion = LinuxDefaultFilename30
+		bpfFile, _ = m.sslVersionBpfMap[LinuxDefaultFilename30]
+		//m.logger.Warn().Str("OpenSSL Version", Linuxdefaulefilename30).Msg("OpenSSL/BoringSSL version not found from shared library file, used default version")
+	} else {
+		m.conf.(*config.OpensslConfig).SslVersion = LinuxDefaultFilename111
+		bpfFile, _ = m.sslVersionBpfMap[LinuxDefaultFilename111]
+		//m.logger.Warn().Str("OpenSSL Version", Linuxdefaulefilename111).Msg("OpenSSL/BoringSSL version not found from shared library file, used default version")
+	}
+	return bpfFile
+}
+
+func getImpNeeded(soPath string) ([]string, error) {
+	var importedNeeded []string
+	f, err := os.OpenFile(soPath, os.O_RDONLY, os.ModePerm)
+	if err != nil {
+		return importedNeeded, fmt.Errorf("can not open %s, with error:%v", soPath, err)
+	}
+
+	elfFile, err := elf.NewFile(f)
+	if err != nil {
+		return importedNeeded, fmt.Errorf("parse the ELF file  %s failed, with error:%v", soPath, err)
+	}
+
+	// 打印外部依赖的动态链接库
+	is, err := elfFile.DynString(elf.DT_NEEDED)
+	//is, err := elfFile.ImportedSymbols()
+	if err != nil {
+		return importedNeeded, err
+	}
+	for _, s := range is {
+		importedNeeded = append(importedNeeded, s)
+	}
+	return importedNeeded, nil
 }

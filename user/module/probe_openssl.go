@@ -20,7 +20,6 @@ import (
 	"crypto"
 	"errors"
 	"fmt"
-	"github.com/rs/zerolog"
 	"io"
 	"os"
 	"path/filepath"
@@ -35,12 +34,17 @@ import (
 
 	"github.com/cilium/ebpf"
 	manager "github.com/gojue/ebpfmanager"
+	"github.com/rs/zerolog"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	ConnNotFound = "[ADDR_NOT_FOUND]"
-	DefaultAddr  = "0.0.0.0"
+	ConnNotFound = "[TUPLE_NOT_FOUND]"
+	DefaultTuple = "0.0.0.0:0-0.0.0.0:0"
+	// OpenSSL the classes of BIOs
+	// https://github.com/openssl/openssl/blob/openssl-3.0.0/include/openssl/bio.h.in
+	BioTypeDescriptor = 0x0100
+	BioTypeSourceSink = 0x0400
 )
 
 type Tls13MasterSecret struct {
@@ -78,9 +82,11 @@ type MOpenSSLProbe struct {
 	eventFuncMaps     map[*ebpf.Map]event.IEventStruct
 	eventMaps         []*ebpf.Map
 
-	// pid[fd:Addr]
-	pidConns  map[uint32]map[uint32]string
-	pidLocker sync.Locker
+	// pid[fd:tuple]
+	pidConns map[uint32]map[uint32]string
+	// sock:[pid,fd], for destroying conn
+	sock2pidFd map[uint64][2]uint32
+	pidLocker  sync.Locker
 
 	keyloggerFilename string
 	keylogger         *os.File
@@ -106,6 +112,7 @@ func (m *MOpenSSLProbe) Init(ctx context.Context, logger *zerolog.Logger, conf c
 	m.eventMaps = make([]*ebpf.Map, 0, 2)
 	m.eventFuncMaps = make(map[*ebpf.Map]event.IEventStruct)
 	m.pidConns = make(map[uint32]map[uint32]string)
+	m.sock2pidFd = make(map[uint64][2]uint32)
 	m.pidLocker = new(sync.Mutex)
 	m.masterKeys = make(map[string]bool)
 	m.sslVersionBpfMap = make(map[string]string)
@@ -194,9 +201,80 @@ func (m *MOpenSSLProbe) getSslBpfFile(soPath, sslVersion string) error {
 		}
 	}
 
-	// 未找到对应的bpf文件，尝试从so文件中获取
-	err := m.detectOpenssl(soPath)
-	return err
+	err, verString := m.detectOpenssl(soPath)
+
+	if err != nil && !errors.Is(err, ErrProbeOpensslVerNotFound) {
+		m.logger.Error().Str("soPath", soPath).Err(err).Msg("OpenSSL/BoringSSL version check failed")
+		return err
+	}
+
+	if errors.Is(err, ErrProbeOpensslVerNotFound) {
+		// 未找到版本号， try libcrypto.so.x
+		if strings.Contains(soPath, "libssl.so.3") {
+			m.logger.Warn().Err(err).Str("soPath", soPath).Msg("OpenSSL/BoringSSL version not found.")
+			m.logger.Warn().Msg("Try to detect libcrypto.so.3. If you have doubts, See https://github.com/gojue/ecapture/discussions/675 for more information.")
+
+			// 从 libssl.so.3 中获取 libcrypto.so.3 的路径
+			var libcryptoName = "libcrypto.so.3"
+			var imd []string
+			imd, err = getImpNeeded(soPath)
+			if err == nil {
+				for _, im := range imd {
+					// 匹配 包含 libcrypto.so 字符的动态链接库库名
+					if strings.Contains(im, "libcrypto.so") {
+						libcryptoName = im
+						break
+					}
+				}
+			}
+			soPath = strings.Replace(soPath, "libssl.so.3", libcryptoName, 1)
+			m.logger.Info().Str("soPath", soPath).Str("imported", libcryptoName).Msg("Try to detect imported libcrypto.so ")
+			err, verString = m.detectOpenssl(soPath)
+			if err != nil && !errors.Is(err, ErrProbeOpensslVerNotFound) {
+				m.logger.Warn().Err(err).Str("soPath", soPath).Str("imported", libcryptoName).Msgf("OpenSSL(libcrypto.so.3) version not found.%s", fmt.Sprintf(OpensslNoticeUsedDefault, OpensslNoticeVersionGuideLinux))
+				return err
+			}
+			if errors.Is(err, ErrProbeOpensslVerNotFound) {
+				m.logger.Info().Str("soPath", soPath).Str("imported", libcryptoName).Str("version", verString).Msg("OpenSSL/BoringSSL version found from imported libcrypto.so")
+			}
+		}
+	}
+
+	var bpfFileKey, bpfFile string
+	isAndroid := m.conf.(*config.OpensslConfig).IsAndroid
+	androidVer := m.conf.(*config.OpensslConfig).AndroidVer
+	if verString != "" {
+		m.conf.(*config.OpensslConfig).SslVersion = verString
+		m.logger.Info().Str("origin versionKey", verString).Str("versionKeyLower", verString).Send()
+		// find the sslVersion bpfFile from sslVersionBpfMap
+		var found bool
+		bpfFileKey = verString
+		if isAndroid {
+			// sometimes,boringssl version always was "boringssl 1.1.1" on android. but offsets are different.
+			// see kern/boringssl_a_13_kern.c and kern/boringssl_a_14_kern.c
+			// Perhaps we can utilize the Android Version to choose a specific version of boringssl.
+			// use the corresponding bpfFile
+			bpfFileKey = fmt.Sprintf("boringssl_a_%s", androidVer)
+		}
+		bpfFile, found = m.sslVersionBpfMap[bpfFileKey]
+		if found {
+			m.sslBpfFile = bpfFile
+			m.logger.Info().Bool("Android", isAndroid).Str("library version", bpfFileKey).Msg("OpenSSL/BoringSSL version found")
+			return nil
+		} else {
+			m.logger.Warn().Str("version", bpfFileKey).Err(ErrProbeOpensslVerBytecodeNotFound).Msg("Please send an issue to https://github.com/gojue/ecapture/issues")
+		}
+	}
+
+	bpfFile = m.getSoDefaultBytecode(soPath, isAndroid)
+	m.sslBpfFile = bpfFile
+	if isAndroid {
+		m.logger.Error().Msgf("OpenSSL/BoringSSL version not found, used default version.%s", fmt.Sprintf(OpensslNoticeUsedDefault, OpensslNoticeVersionGuideAndroid))
+	} else {
+		m.logger.Error().Msgf("OpenSSL/BoringSSL version not found, used default version.%s", fmt.Sprintf(OpensslNoticeUsedDefault, OpensslNoticeVersionGuideLinux))
+	}
+	m.logger.Error().Str("sslVersion", m.conf.(*config.OpensslConfig).SslVersion).Str("bpfFile", bpfFile).Send()
+	return nil
 }
 
 func (m *MOpenSSLProbe) Start() error {
@@ -317,9 +395,9 @@ func (m *MOpenSSLProbe) Events() []*ebpf.Map {
 	return m.eventMaps
 }
 
-func (m *MOpenSSLProbe) AddConn(pid, fd uint32, addr string) {
+func (m *MOpenSSLProbe) AddConn(pid, fd uint32, tuple string, sock uint64) {
 	if fd <= 0 {
-		m.logger.Info().Uint32("pid", pid).Uint32("fd", fd).Str("address", addr).Msg("AddConn failed")
+		m.logger.Info().Uint32("pid", pid).Uint32("fd", fd).Str("tuple", tuple).Msg("AddConn failed")
 		return
 	}
 	// save
@@ -331,10 +409,40 @@ func (m *MOpenSSLProbe) AddConn(pid, fd uint32, addr string) {
 	if !f {
 		connMap = make(map[uint32]string)
 	}
-	connMap[fd] = addr
+	connMap[fd] = tuple
 	m.pidConns[pid] = connMap
-	m.logger.Debug().Uint32("pid", pid).Uint32("fd", fd).Str("address", addr).Msg("AddConn success")
-	return
+
+	m.sock2pidFd[sock] = [2]uint32{pid, fd}
+
+	m.logger.Debug().Uint32("pid", pid).Uint32("fd", fd).Str("tuple", tuple).Msg("AddConn success")
+}
+
+func (m *MOpenSSLProbe) DestroyConn(sock uint64) {
+	m.pidLocker.Lock()
+	defer m.pidLocker.Unlock()
+
+	pidFd, ok := m.sock2pidFd[sock]
+	if !ok {
+		return
+	}
+
+	delete(m.sock2pidFd, sock)
+	pid, fd := pidFd[0], pidFd[1]
+
+	connMap, ok := m.pidConns[pid]
+	if !ok {
+		return
+	}
+
+	tuple, ok := connMap[fd]
+	if ok {
+		delete(connMap, fd)
+		if len(connMap) == 0 {
+			delete(m.pidConns, pid)
+		}
+	}
+
+	m.logger.Debug().Uint32("pid", pid).Uint32("fd", fd).Str("tuple", tuple).Msg("DestroyConn success")
 }
 
 // process exit :fd is 0 , delete all pid map
@@ -365,7 +473,7 @@ func (m *MOpenSSLProbe) GetConn(pid, fd uint32) string {
 	if fd <= 0 {
 		return ConnNotFound
 	}
-	addr := ""
+	tuple := ""
 	var connMap map[uint32]string
 	var f bool
 	m.logger.Debug().Uint32("pid", pid).Uint32("fd", fd).Msg("GetConn")
@@ -375,11 +483,11 @@ func (m *MOpenSSLProbe) GetConn(pid, fd uint32) string {
 	if !f {
 		return ConnNotFound
 	}
-	addr, f = connMap[fd]
+	tuple, f = connMap[fd]
 	if !f {
 		return ConnNotFound
 	}
-	return addr
+	return tuple
 }
 
 func (m *MOpenSSLProbe) saveMasterSecret(secretEvent *event.MasterSecretEvent) {
@@ -630,34 +738,39 @@ func (m *MOpenSSLProbe) mk13NullSecrets(hashLen int,
 
 func (m *MOpenSSLProbe) Dispatcher(eventStruct event.IEventStruct) {
 	// detect eventStruct type
-	switch eventStruct.(type) {
+	switch ev := eventStruct.(type) {
 	case *event.ConnDataEvent:
-		m.AddConn(eventStruct.(*event.ConnDataEvent).Pid, eventStruct.(*event.ConnDataEvent).Fd, eventStruct.(*event.ConnDataEvent).Addr)
+		if ev.IsDestroy == 0 {
+			m.AddConn(ev.Pid, ev.Fd, ev.Tuple, ev.Sock)
+		} else {
+			m.DestroyConn(ev.Sock)
+		}
 	case *event.MasterSecretEvent:
-		m.saveMasterSecret(eventStruct.(*event.MasterSecretEvent))
+		m.saveMasterSecret(ev)
 	case *event.MasterSecretBSSLEvent:
-		m.saveMasterSecretBSSL(eventStruct.(*event.MasterSecretBSSLEvent))
+		m.saveMasterSecretBSSL(ev)
 	case *event.TcSkbEvent:
-		err := m.dumpTcSkb(eventStruct.(*event.TcSkbEvent))
+		err := m.dumpTcSkb(ev)
 		if err != nil {
 			m.logger.Error().Err(err).Msg("save packet error.")
 		}
 	case *event.SSLDataEvent:
-		m.dumpSslData(eventStruct.(*event.SSLDataEvent))
+		m.dumpSslData(ev)
 	}
 }
 
 func (m *MOpenSSLProbe) dumpSslData(eventStruct *event.SSLDataEvent) {
-	if eventStruct.Fd <= 0 {
-		m.logger.Error().Uint32("pid", eventStruct.Pid).Uint32("fd", eventStruct.Fd).Str("address", eventStruct.Addr).Msg("SSLDataEvent's fd is 0")
+	// BIO_TYPE_SOURCE_SINK|BIO_TYPE_DESCRIPTOR = 0x0400|0x0100 = 1280
+	if eventStruct.Fd <= 0 && eventStruct.BioType > BioTypeSourceSink|BioTypeDescriptor {
+		m.logger.Error().Uint32("pid", eventStruct.Pid).Uint32("fd", eventStruct.Fd).Str("tuple", eventStruct.Tuple).Msg("SSLDataEvent's fd is 0")
 		//return
 	}
-	addr := m.GetConn(eventStruct.Pid, eventStruct.Fd)
-	m.logger.Debug().Uint32("pid", eventStruct.Pid).Uint32("fd", eventStruct.Fd).Str("address", addr).Msg("SSLDataEvent")
-	if addr == ConnNotFound {
-		eventStruct.Addr = DefaultAddr
+	tuple := m.GetConn(eventStruct.Pid, eventStruct.Fd)
+	m.logger.Debug().Uint32("pid", eventStruct.Pid).Uint32("bio_type", eventStruct.BioType).Uint32("fd", eventStruct.Fd).Str("tuple", tuple).Msg("SSLDataEvent")
+	if tuple == ConnNotFound {
+		eventStruct.Tuple = DefaultTuple
 	} else {
-		eventStruct.Addr = addr
+		eventStruct.Tuple = tuple
 	}
 	// m.processor.PcapFile(eventStruct)
 	//if m.conf.GetHex() {
